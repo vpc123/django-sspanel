@@ -5,8 +5,13 @@ METHOD_CHOICES = (
     ("salsa20", "salsa20"),
     ("chacha20", "chacha20"),
     ("none", "none"),
+    ("chacha20-ietf-poly1305", "chacha20-ietf-poly1305"),
+    ("aes-128-gcm", "aes-128-gcm"),
+    ("aes-256-gcm", "aes-256-gcm"),
 )
 
+
+AEAD_METHODS = {"chacha20-ietf-poly1305", "aes-128-gcm", "aes-256-gcm"}
 
 COUNTRIES_CHOICES = (
     ("US", "美国"),
@@ -58,3 +63,26 @@ THEME_CHOICES = (
 
 # 判断节点在线时间间隔
 NODE_TIME_OUT = 75
+
+
+# ehco隧道相关
+LISTEN_RAW = "raw"
+LISTEN_WSS = "wss"
+LISTEN_MWSS = "mwss"
+LISTEN_TYPES = (
+    (LISTEN_RAW, "raw"),
+    (LISTEN_WSS, "wss"),
+    (LISTEN_MWSS, "mwss"),
+)
+
+TRANSPORT_RAW = "raw"
+TRANSPORT_WSS = "wss"
+TRANSPORT_MWSS = "mwss"
+TRANSPORT_TYPES = (
+    (TRANSPORT_RAW, "raw"),
+    (TRANSPORT_WSS, "wss"),
+    (TRANSPORT_MWSS, "mwss"),
+)
+
+WS_LISTENERS = {LISTEN_WSS, LISTEN_MWSS}
+WS_TRANSPORTS = {TRANSPORT_WSS, TRANSPORT_MWSS}

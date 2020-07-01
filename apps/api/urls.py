@@ -10,7 +10,6 @@ urlpatterns = [
     path("gen/invitecode/", views.gen_invite_code, name="geninvitecode"),
     path("shop/", views.purchase, name="purchase"),
     path("change/theme/", views.change_theme, name="change_theme"),
-    path("change/sub_type/", views.change_sub_type, name="change_sub_type"),
     path("checkin/", views.UserCheckInView.as_view(), name="checkin"),
     # web api 接口
     path(
@@ -29,9 +28,14 @@ urlpatterns = [
         name="vmess_server_config",
     ),
     path(
-        "relay_server_config/<int:node_id>/",
-        views.RelayServerConfigView.as_view(),
-        name="relay_server_config",
+        "ehco_relay_config/<int:node_id>/",
+        views.EhcoRelayConfigView.as_view(),
+        name="ehco_relay_config",
+    ),
+    path(
+        "ehco_server_config/<int:node_id>/",
+        views.EhcoServerConfigView.as_view(),
+        name="ehco_server_config",
     ),
     # 支付
     path("orders", views.OrderView.as_view(), name="order"),

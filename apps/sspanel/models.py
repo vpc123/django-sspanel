@@ -1,9 +1,10 @@
-import re
 import base64
 import datetime
-import random
-import time
 import json
+import random
+import re
+import time
+from copy import deepcopy
 from decimal import Decimal
 from urllib.parse import quote, urlencode
 from uuid import uuid4
@@ -18,29 +19,33 @@ from django.core.mail import send_mail
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import connection, models, transaction
 from django.forms.models import model_to_dict
+from django.template.loader import render_to_string
 from django.utils import functional, timezone
 
-from apps.constants import (
-    COUNTRIES_CHOICES,
-    METHOD_CHOICES,
-    NODE_TIME_OUT,
-    THEME_CHOICES,
-)
+from apps import constants as c
 from apps.ext import cache, encoder, pay
 from apps.utils import get_long_random_string, get_short_random_string, traffic_format
 
 
 class User(AbstractUser):
 
-    SUB_TYPE_SS = 0
-    SUB_TYPE_VMESS = 1
-    SUB_TYPE_ALL = 2
-
+    SUB_TYPE_SS = "ss"
+    SUB_TYPE_VMESS = "vmess"
+    SUB_TYPE_ALL = "all"
+    SUB_TYPE_CLASH = "clash"
+    SUB_TYPES_SET = {SUB_TYPE_SS, SUB_TYPE_VMESS, SUB_TYPE_ALL, SUB_TYPE_CLASH}
     SUB_TYPES = (
         (SUB_TYPE_SS, "只订阅SS"),
         (SUB_TYPE_VMESS, "只订阅Vmess"),
         (SUB_TYPE_ALL, "订阅所有"),
+        (SUB_TYPE_CLASH, "通过Clash订阅所有"),
     )
+
+    MIN_PORT = 1025
+    PORT_BLACK_SET = {6443, 8472}
+
+    class Meta(AbstractUser.Meta):
+        verbose_name_plural = "用户"
 
     balance = models.DecimalField(
         verbose_name="余额",
@@ -60,22 +65,27 @@ class User(AbstractUser):
     level_expire_time = models.DateTimeField(verbose_name="等级有效期", default=timezone.now)
     theme = models.CharField(
         verbose_name="主题",
-        choices=THEME_CHOICES,
+        choices=c.THEME_CHOICES,
         default=settings.DEFAULT_THEME,
         max_length=10,
     )
-    sub_type = models.SmallIntegerField(
-        verbose_name="订阅类型", choices=SUB_TYPES, default=SUB_TYPE_ALL
-    )
     inviter_id = models.PositiveIntegerField(verbose_name="邀请人id", default=1)
+
+    # v2ray相关
     vmess_uuid = models.CharField(verbose_name="Vmess uuid", max_length=64, default="")
 
-    class Meta(AbstractUser.Meta):
-        verbose_name_plural = "用户"
-
-    def delete(self):
-        self.user_ss_config.delete()
-        return super(User, self).delete()
+    ss_port = models.IntegerField("端口", unique=True, default=MIN_PORT)
+    ss_password = models.CharField(
+        "密码", max_length=32, default=get_short_random_string, unique=True
+    )
+    ss_method = models.CharField(
+        "加密", default=settings.DEFAULT_METHOD, max_length=32, choices=c.METHOD_CHOICES
+    )
+    # 流量相关
+    upload_traffic = models.BigIntegerField("上传流量", default=0)
+    download_traffic = models.BigIntegerField("下载流量", default=0)
+    total_traffic = models.BigIntegerField("总流量", default=settings.DEFAULT_TRAFFIC)
+    last_use_time = models.DateTimeField("上次使用时间", blank=True, db_index=True, null=True)
 
     def __str__(self):
         return self.username
@@ -94,22 +104,25 @@ class User(AbstractUser):
     @transaction.atomic
     def add_new_user(cls, cleaned_data):
         user = cls.objects.create_user(
-            cleaned_data["username"], cleaned_data["email"], cleaned_data["password1"]
+            cleaned_data["username"],
+            cleaned_data["email"],
+            cleaned_data["password1"],
+            ss_port=cls.get_not_used_port(),
         )
+        inviter_id = None
         if "invitecode" in cleaned_data:
             code = InviteCode.objects.get(code=cleaned_data["invitecode"])
             code.consume()
             inviter_id = code.user_id
         elif "ref" in cleaned_data:
-            inviter_id = encoder.string2int(cleaned_data["ref"])
-        # 绑定邀请人
-        UserRefLog.log_ref(inviter_id, pendulum.today())
-        user.inviter_id = inviter_id
+            inviter_id = cleaned_data["ref"]
+        if inviter_id:
+            # 绑定邀请人
+            UserRefLog.log_ref(inviter_id, pendulum.today())
+            user.inviter_id = inviter_id
         # 绑定uuid
         user.vmess_uuid = str(uuid4())
         user.save()
-        # 添加SSconfig
-        UserSSConfig.create_by_user_id(user.id)
         return user
 
     @classmethod
@@ -117,7 +130,6 @@ class User(AbstractUser):
         return cls.objects.get(username=username)
 
     @classmethod
-    @cache.cached(ttl=60 * 60 * 24)
     def get_by_pk(cls, pk):
         return cls.objects.get(pk=pk)
 
@@ -142,6 +154,50 @@ class User(AbstractUser):
                 f"您的账号现被暂停使用。如需继续使用请前往 {settings.HOST} 充值",
             )
 
+    @classmethod
+    def check_and_disable_out_of_traffic_user(cls):
+        # NOTE cronjob用 先不加索引
+        out_of_traffic_users = list(
+            cls.objects.filter(
+                level__gt=0,
+                total_traffic__lte=(
+                    models.F("upload_traffic") + models.F("download_traffic")
+                ),
+            )
+        )
+        for user in out_of_traffic_users:
+            user.level = 0
+            user.save()
+            print(f"user: {user} traffic overflow!")
+
+        if out_of_traffic_users and settings.EXPIRE_EMAIL_NOTICE:
+            EmailSendLog.send_mail_to_users(
+                out_of_traffic_users,
+                f"您的{settings.TITLE}账号流量已全部用完",
+                f"您的账号现被暂停使用。如需继续使用请前往 {settings.HOST} 充值",
+            )
+            print(f"共有{len(out_of_traffic_users)}个用户流量用超啦")
+
+    @classmethod
+    def get_not_used_port(cls):
+        port_set = {log["ss_port"] for log in cls.objects.all().values("ss_port")}
+        if not port_set:
+            return cls.MIN_PORT
+        max_port = max(port_set) + 1
+        port_set = {i for i in range(cls.MIN_PORT, max_port + 1)}.difference(
+            port_set.union(cls.PORT_BLACK_SET)
+        )
+        return random.choice(list(port_set))
+
+    @classmethod
+    def get_never_used_user_count(cls):
+        return cls.objects.filter(last_use_time__isnull=True).count()
+
+    @classmethod
+    def get_user_order_by_traffic(cls, count=10):
+        # NOTE 后台展示用 暂时不加索引
+        return cls.objects.all().order_by("-download_traffic")[:count]
+
     @property
     def sub_link(self):
         """订阅地址"""
@@ -151,12 +207,8 @@ class User(AbstractUser):
     @property
     def ref_link(self):
         """ref地址"""
-        params = {"ref": self.token}
-        return settings.HOST + f"/sspanel/register/?{urlencode(params)}"
-
-    @functional.cached_property
-    def user_ss_config(self):
-        return UserSSConfig.objects.get(user_id=self.id)
+        params = {"ref": self.id}
+        return settings.HOST + f"/register/?{urlencode(params)}"
 
     @property
     def today_is_checkin(self):
@@ -166,24 +218,95 @@ class User(AbstractUser):
     def token(self):
         return encoder.int2string(self.pk)
 
-    def get_sub_links(self):
+    @property
+    def human_total_traffic(self):
+        return traffic_format(self.total_traffic)
 
-        if self.sub_type == self.SUB_TYPE_SS:
-            node_list = list(SSNode.get_active_nodes())
-        if self.sub_type == self.SUB_TYPE_VMESS:
-            node_list = list(VmessNode.get_active_nodes())
-        if self.sub_type == self.SUB_TYPE_ALL:
-            node_list = list(SSNode.get_active_nodes()) + list(
-                VmessNode.get_active_nodes()
-            )
+    @property
+    def human_used_traffic(self):
+        return traffic_format(self.used_traffic)
 
+    @property
+    def human_remain_traffic(self):
+        return traffic_format(self.total_traffic - self.used_traffic)
+
+    @property
+    def overflow(self):
+        return (self.upload_traffic + self.download_traffic) > self.total_traffic
+
+    @property
+    def used_traffic(self):
+        return self.upload_traffic + self.download_traffic
+
+    @property
+    def used_percentage(self):
+        try:
+            return round(self.used_traffic / self.total_traffic * 100, 2)
+        except ZeroDivisionError:
+            return 100.00
+
+    @property
+    def remain_percentage(self):
+        return 100.00 - self.used_percentage
+
+    @transaction.atomic
+    def reset_random_port(self):
+        cls = type(self)
+        port = cls.get_not_used_port()
+        self.port = port
+        self.save()
+        return port
+
+    def get_sub_links(self, sub_type):
+        if sub_type not in self.SUB_TYPES_SET:
+            sub_type = self.SUB_TYPE_CLASH
+
+        if sub_type == self.SUB_TYPE_CLASH:
+            return self.get_clash_sub_links()
+        node_list = []
+        if sub_type in [self.SUB_TYPE_SS, self.SUB_TYPE_ALL]:
+            node_list.extend(SSNode.get_user_active_nodes(self, True))
+        if sub_type in [self.SUB_TYPE_VMESS, self.SUB_TYPE_ALL]:
+            node_list.extend(VmessNode.get_user_active_nodes(self, True))
         sub_links = "MAX={}\n".format(len(node_list))
         for node in node_list:
             if type(node) == SSNode:
-                sub_links += node.get_ss_link(self.user_ss_config) + "\n"
+                sub_links += node.get_ss_link(self) + "\n"
             if type(node) == VmessNode:
                 sub_links += node.get_vmess_link(self) + "\n"
+        sub_links = base64.urlsafe_b64encode(sub_links.encode()).decode()
         return sub_links
+
+    def get_clash_sub_links(self):
+        node_list = SSNode.get_user_active_nodes(
+            self, sub_mode=True
+        ) + VmessNode.get_user_active_nodes(self, sub_mode=True)
+
+        for node in node_list:
+            node.clash_link = node.get_clash_link(self)
+        return render_to_string("yamls/clash.yml", {"nodes": node_list})
+
+    def update_from_dict(self, data):
+        clean_fields = ["ss_password", "ss_method"]
+        for k, v in data.items():
+            if k in clean_fields:
+                setattr(self, k, v)
+        try:
+            self.full_clean()
+            self.save()
+            return True
+        except ValidationError:
+            return False
+
+    def reset_traffic(self, new_traffic):
+        self.total_traffic = new_traffic
+        self.upload_traffic = 0
+        self.download_traffic = 0
+
+    def reset_to_fresh(self):
+        self.enable = False
+        self.reset_traffic(settings.DEFAULT_TRAFFIC)
+        self.save()
 
 
 class UserPropertyMixin:
@@ -212,7 +335,7 @@ class UserOrder(models.Model, UserPropertyMixin):
     out_trade_no = models.CharField(
         verbose_name="流水号", max_length=64, unique=True, db_index=True
     )
-    qrcode_url = models.CharField(verbose_name="支付连接", max_length=64, null=True)
+    qrcode_url = models.CharField(verbose_name="支付连接", max_length=512, null=True)
     amount = models.DecimalField(
         verbose_name="金额", decimal_places=2, max_digits=10, default=0
     )
@@ -386,7 +509,7 @@ class UserOnLineIpLog(models.Model, UserPropertyMixin):
         ret = []
         for log in cls.objects.filter(
             node_id=node_id,
-            created_at__range=[now.subtract(seconds=NODE_TIME_OUT), now],
+            created_at__range=[now.subtract(seconds=c.NODE_TIME_OUT), now],
         ):
             if log.ip not in ip_set:
                 ret.append(log)
@@ -414,14 +537,13 @@ class UserCheckInLog(models.Model, UserPropertyMixin):
 
     @classmethod
     @transaction.atomic
-    def checkin(cls, user_id):
+    def checkin(cls, user):
         traffic = random.randint(
             settings.MIN_CHECKIN_TRAFFIC, settings.MAX_CHECKIN_TRAFFIC
         )
-        user_traffic = UserTraffic.get_by_user_id(user_id)
-        user_traffic.total_traffic += traffic
-        user_traffic.save()
-        return cls.add_log(user_id, traffic)
+        user.total_traffic += traffic
+        user.save()
+        return cls.add_log(user.id, traffic)
 
     @classmethod
     def get_today_is_checkin_by_user_id(cls, user_id):
@@ -434,172 +556,6 @@ class UserCheckInLog(models.Model, UserPropertyMixin):
     @property
     def human_increased_traffic(self):
         return traffic_format(self.increased_traffic)
-
-
-class UserSSConfig(models.Model, UserPropertyMixin):
-
-    MIN_PORT = 1025
-    PORT_BLACK_SET = {6443, 8472}
-
-    user_id = models.IntegerField(unique=True, db_index=True)
-    port = models.IntegerField("端口", unique=True, default=MIN_PORT)
-    password = models.CharField("密码", max_length=32, default=get_short_random_string)
-    enable = models.BooleanField("是否开启", default=True)
-    method = models.CharField(
-        "加密", default=settings.DEFAULT_METHOD, max_length=32, choices=METHOD_CHOICES
-    )
-
-    class Meta:
-        verbose_name_plural = "用户SS配置"
-
-    @classmethod
-    @transaction.atomic
-    def create_by_user_id(cls, user_id):
-        # TODO 暂时在这里创建usertraffic 以后如果再增加节点类型可以挪走
-        config = cls.objects.create(user_id=user_id, port=cls.get_not_used_port())
-        UserTraffic.objects.create(user_id=user_id)
-        return config
-
-    @classmethod
-    def get_not_used_port(cls):
-        port_set = {log["port"] for log in cls.objects.all().values("port")}
-        if not port_set:
-            return cls.MIN_PORT
-        max_port = max(port_set) + 1
-        port_set = {i for i in range(cls.MIN_PORT, max_port + 1)}.difference(
-            port_set.union(cls.PORT_BLACK_SET)
-        )
-        return random.choice(list(port_set))
-
-    @classmethod
-    def get_by_user_id(cls, user_id):
-        return cls.objects.get(user_id=user_id)
-
-    @classmethod
-    def get_configs_by_user_level(cls, level):
-        user_ids = [
-            d[0] for d in User.objects.filter(level__gte=level).values_list("id")
-        ]
-        return UserSSConfig.objects.filter(user_id__in=user_ids)
-
-    @functional.cached_property
-    def user_traffic(self):
-        return UserTraffic.get_by_user_id(self.user_id)
-
-    @property
-    def human_total_traffic(self):
-        return traffic_format(self.user_traffic.total_traffic)
-
-    @property
-    def human_used_traffic(self):
-        return traffic_format(self.user_traffic.used_traffic)
-
-    @transaction.atomic
-    def reset_random_port(self):
-        cls = type(self)
-        port = cls.get_not_used_port()
-        self.port = port
-        self.save()
-        return port
-
-    def update_from_dict(self, data):
-        clean_fields = ["password", "method"]
-        for k, v in data.items():
-            if k in clean_fields:
-                setattr(self, k, v)
-        try:
-            self.full_clean()
-            self.save()
-            return True
-        except ValidationError:
-            return False
-
-    def get_import_links(self):
-        links = [node.get_ss_link(self) for node in SSNode.get_active_nodes()]
-        return "\n".join(links)
-
-
-class UserTraffic(models.Model, UserPropertyMixin):
-
-    user_id = models.IntegerField(unique=True, db_index=True)
-    upload_traffic = models.BigIntegerField("上传流量", default=0)
-    download_traffic = models.BigIntegerField("下载流量", default=0)
-    total_traffic = models.BigIntegerField("总流量", default=settings.DEFAULT_TRAFFIC)
-    last_use_time = models.DateTimeField("上次使用时间", blank=True, db_index=True, null=True)
-
-    class Meta:
-        verbose_name_plural = "用户流量"
-
-    @classmethod
-    def get_never_used_user_count(cls):
-        return cls.objects.filter(last_use_time__isnull=True).count()
-
-    @classmethod
-    def get_by_user_id(cls, user_id):
-        return cls.objects.get(user_id=user_id)
-
-    @classmethod
-    def get_overflow_user_ids(cls):
-        # NOTE cronjob用 先不加索引
-        uts = cls.objects.filter(
-            total_traffic__lte=(
-                models.F("upload_traffic") + models.F("download_traffic")
-            )
-        ).values_list("user_id")
-        return [ut[0] for ut in uts]
-
-    @classmethod
-    def check_and_disable_out_of_traffic_user(cls):
-        need_disable_user_ids = UserTraffic.get_overflow_user_ids()
-        user_ss_configs = UserSSConfig.objects.filter(user_id__in=need_disable_user_ids)
-        need_set_user_ids = [c.user_id for c in user_ss_configs if c.enable]
-        UserSSConfig.objects.filter(user_id__in=need_set_user_ids).update(enable=False)
-        user_list = User.objects.filter(id__in=need_set_user_ids)
-        if user_list and settings.EXPIRE_EMAIL_NOTICE:
-            EmailSendLog.send_mail_to_users(
-                user_list,
-                f"您的{settings.TITLE}账号流量已全部用完",
-                f"您的账号现被暂停使用。如需继续使用请前往 {settings.HOST} 充值",
-            )
-            print(f"共有{len(user_list)}个用户流量用超啦")
-
-    @property
-    def overflow(self):
-        return (self.upload_traffic + self.download_traffic) > self.total_traffic
-
-    @property
-    def used_traffic(self):
-        return self.upload_traffic + self.download_traffic
-
-    @property
-    def used_percentage(self):
-        try:
-            return round(self.used_traffic / self.total_traffic * 100, 2)
-        except ZeroDivisionError:
-            return 100.00
-
-    @property
-    def human_used_traffic(self):
-        return traffic_format(self.used_traffic)
-
-    @property
-    def user(self):
-        return User.get_by_pk(self.user_id)
-
-    @classmethod
-    def get_user_order_by_traffic(cls, count=10):
-        # NOTE 后台展示用 暂时不加索引
-        return cls.objects.all().order_by("-download_traffic")[:count]
-
-    def reset_traffic(self, new_traffic):
-        self.total_traffic = new_traffic
-        self.upload_traffic = 0
-        self.download_traffic = 0
-
-    def reset_to_fresh(self):
-        self.enable = False
-        self.reset_traffic(settings.DEFAULT_TRAFFIC)
-        self.save()
 
 
 class NodeOnlineLog(models.Model):
@@ -622,7 +578,7 @@ class NodeOnlineLog(models.Model):
 
     @property
     def online(self):
-        return pendulum.now().subtract(seconds=NODE_TIME_OUT) < self.created_at
+        return pendulum.now().subtract(seconds=c.NODE_TIME_OUT) < self.created_at
 
     @classmethod
     def truncate(cls):
@@ -665,19 +621,20 @@ class NodeOnlineLog(models.Model):
     def get_latest_online_log_info(cls, node_type, node_id):
         data = {"online": False, "online_user_count": 0, "active_tcp_connections": 0}
         log = cls.get_latest_log_by_node_id(node_type, node_id)
-        if log:
+        if log and log.online:
             data["online"] = log.online
             data.update(model_to_dict(log))
         return data
 
 
 class BaseAbstractNode(models.Model):
+
     node_id = models.IntegerField(unique=True)
     level = models.PositiveIntegerField(default=0)
     name = models.CharField("名字", max_length=32)
     info = models.CharField("节点说明", max_length=1024)
     country = models.CharField(
-        "国家", default="CN", max_length=5, choices=COUNTRIES_CHOICES
+        "国家", default="CN", max_length=5, choices=c.COUNTRIES_CHOICES
     )
     used_traffic = models.BigIntegerField("已用流量", default=0)
     total_traffic = models.BigIntegerField("总流量", default=settings.GB)
@@ -686,16 +643,56 @@ class BaseAbstractNode(models.Model):
         "倍率", default=Decimal("1.0"), decimal_places=2, max_digits=10,
     )
 
+    ehco_listen_host = models.CharField("隧道监听地址", max_length=64, blank=True, null=True)
+    ehco_listen_port = models.CharField("隧道监听端口", max_length=64, blank=True, null=True)
+    ehco_listen_type = models.CharField(
+        "隧道监听类型", max_length=64, choices=c.LISTEN_TYPES, default=c.LISTEN_RAW
+    )
+    ehco_transport_type = models.CharField(
+        "隧道传输类型", max_length=64, choices=c.TRANSPORT_TYPES, default=c.TRANSPORT_RAW
+    )
+
     class Meta:
         abstract = True
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_active_nodes(cls, sub_mode=False):
+        active_nodes = (
+            cls.objects.filter(enable=True)
+            .select_related()
+            .order_by("level", "country")
+        )
+        if not sub_mode:
+            return list(active_nodes)
+        # NOTE 在订阅模式下,如果一条节点配置了relay_rule,将一条线路变成多条,既然是py就写的魔幻一点
+        nodes = list()
+        for node in active_nodes:
+            if node.enable_relay:
+                for rule in node.get_enable_relay_rules():
+                    node = deepcopy(node)
+                    node.name = rule.remark
+                    node.server = rule.relay_host
+                    node.port = rule.relay_port
+                    node.client_port = rule.relay_port
+                    nodes.append(node)
+            else:
+                nodes.append(node)
+        return nodes
 
     @classmethod
     def get_or_none_by_node_id(cls, node_id):
         return cls.objects.filter(node_id=node_id).first()
 
     @classmethod
-    def get_active_nodes(cls):
-        return cls.objects.filter(enable=True).order_by("level", "country")
+    def get_user_active_nodes(cls, user, sub_mode=False):
+        nodes = []
+        for node in cls.get_active_nodes(sub_mode):
+            if user.level >= node.level:
+                nodes.append(node)
+        return nodes
 
     @classmethod
     def get_node_ids_by_level(cls, level):
@@ -707,10 +704,6 @@ class BaseAbstractNode(models.Model):
         cls.objects.filter(node_id=node_id).update(
             used_traffic=models.F("used_traffic") + used_traffic
         )
-
-    @classmethod
-    def get_user_active_nodes(cls, user):
-        return cls.objects.filter(enable=True, level__lte=user.level)
 
     @property
     def human_total_traffic(self):
@@ -736,19 +729,86 @@ class BaseAbstractNode(models.Model):
     def active_tcp_connections(self):
         return self.online_info["active_tcp_connections"]
 
+    @functional.cached_property
+    def enable_relay(self):
+        return bool(self.relay_rules.exists())
+
+    @property
+    def enable_ehco(self):
+        # 是否开启ehco隧道
+        return (
+            self.ehco_listen_host
+            and self.ehco_listen_port
+            and self.ehco_listen_type in c.WS_LISTENERS
+        )
+
+    @property
+    def ehco_api_endpoint(self):
+        # 隧道监听配置api
+        params = {"token": settings.TOKEN, "node_type": self.node_type}
+        return (
+            settings.HOST
+            + f"/api/ehco_server_config/{self.node_id}/?{urlencode(params)}"
+        )
+
+    @property
+    def ehco_relay_port(self):
+        if self.node_type == "ss":
+            return self.port
+        else:
+            return self.service_port
+
+    @property
+    def ehco_relay_host(self):
+        return "0.0.0.0"
+
+    def get_ehco_server_config(self):
+        return {
+            "configs": [
+                {
+                    "listen": f"{self.ehco_listen_host}:{self.ehco_listen_port}",
+                    "listen_type": self.ehco_listen_type,
+                    "remote": f"{self.ehco_relay_host}:{self.ehco_relay_port}",
+                    "transport_type": self.ehco_transport_type,
+                }
+            ]
+        }
+
+    def get_enable_relay_rules(self):
+        return self.relay_rules.filter(relay_node__enable=True)
+
 
 class VmessNode(BaseAbstractNode):
 
+    BASE_CONFIG = {
+        "stats": {},
+        "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
+        "log": {"loglevel": "info"},
+        "policy": {
+            "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
+        },
+        "inbounds": [],
+        "outbounds": [{"protocol": "freedom", "settings": {}}],
+        "routing": {
+            "settings": {
+                "rules": [
+                    {"inboundTag": ["api"], "outboundTag": "api", "type": "field"}
+                ]
+            },
+            "strategy": "rules",
+        },
+    }
+
     server = models.CharField("服务器地址", max_length=128)
     inbound_tag = models.CharField("标签", default="proxy", max_length=64)
-    port = models.IntegerField("端口", default=10086)
-    offset_port = models.IntegerField("偏移端口", blank=True, null=True)
+    service_port = models.IntegerField("服务端端口", default=10086)
+    client_port = models.IntegerField("客户端端口", default=10086)
     alter_id = models.IntegerField("额外ID数量", default=1)
-    grpc_host = models.CharField("Grpc地址", max_length=64, default="0.0.0.0")
-    grpc_port = models.CharField("Grpc端口", max_length=64, default="8080")
-    relay_host = models.CharField("中转地址", max_length=64, blank=True, null=True)
-    relay_port = models.CharField("中转端口", max_length=64, blank=True, null=True)
-    relay_offset_port = models.IntegerField("中转偏移端口", blank=True, null=True)
+    listen_host = models.CharField("本地监听地址", max_length=64, default="0.0.0.0")
+    grpc_host = models.CharField("grpc地址", max_length=64, default="0.0.0.0")
+    grpc_port = models.CharField("grpc端口", max_length=64, default="8080")
+    ws_host = models.CharField("域名", max_length=64, blank=True, null=True)
+    ws_path = models.CharField("ws_path", max_length=64, blank=True, null=True)
 
     class Meta:
         verbose_name_plural = "Vmess节点"
@@ -760,12 +820,16 @@ class VmessNode(BaseAbstractNode):
         if not node:
             return {"tag": "", "configs": []}
 
-        user_ids = []
         configs = []
         for d in User.objects.filter(level__gte=node.level).values(
-            "id", "email", "vmess_uuid"
+            "id",
+            "email",
+            "vmess_uuid",
+            "total_traffic",
+            "upload_traffic",
+            "download_traffic",
         ):
-            user_ids.append(d["id"])
+            enable = d["total_traffic"] > (d["download_traffic"] + d["upload_traffic"])
             configs.append(
                 {
                     "user_id": d["id"],
@@ -773,44 +837,25 @@ class VmessNode(BaseAbstractNode):
                     "uuid": d["vmess_uuid"],
                     "level": node.level,
                     "alter_id": node.alter_id,
+                    "enable": enable,
                 }
             )
-        ut_overflow_map = {
-            ut.user_id: ut.overflow
-            for ut in UserTraffic.objects.filter(user_id__in=user_ids)
-        }
-        for cfg in configs:
-            if not node.enable:
+        if not node.enable:
+            for cfg in configs:
                 cfg["enable"] = False
-            else:
-                cfg["enable"] = not ut_overflow_map[cfg["user_id"]]
-        return {"configs": configs, "tag": node.inbound_tag}
+        return {
+            "configs": configs,
+            "tag": node.inbound_tag,
+            "grpc_endpoint": f"{node.grpc_host}:{node.grpc_port}",
+        }
 
     @property
     def node_type(self):
         return "vmess"
 
     @property
-    def enable_relay(self):
-        return bool(self.relay_host and self.relay_port)
-
-    @property
-    def display_host(self):
-        if self.enable_relay:
-            return self.relay_host
-        return self.server
-
-    @property
-    def display_port(self):
-        """显示出去的端口"""
-        # NOTE  优先级relay_offset_port> relay_port > offset_port > prot
-        if self.enable_relay:
-            if self.relay_offset_port:
-                return self.relay_offset_port
-            return self.relay_port
-        if self.offset_port:
-            return self.offset_port
-        return self.port
+    def enable_ws(self):
+        return self.ws_host and self.ws_path
 
     @property
     def human_speed_limit(self):
@@ -834,80 +879,51 @@ class VmessNode(BaseAbstractNode):
         )
 
     @property
-    def relay_config_endpoint(self):
-        params = {"token": settings.TOKEN}
-        return (
-            settings.HOST
-            + f"/api/relay_server_config/{self.node_id}/?{urlencode(params)}"
-        )
+    def level_policy(self):
+        return {self.level: {"statsUserUplink": True, "statsUserDownlink": True}}
+
+    @property
+    def grpc_inbound(self):
+        return {
+            "listen": self.grpc_host,
+            "port": self.grpc_port,
+            "protocol": "dokodemo-door",
+            "settings": {"address": self.grpc_host},
+            "tag": "api",
+        }
+
+    @property
+    def vmess_inbound(self):
+        inbound = {
+            "port": self.service_port,
+            "protocol": "vmess",
+            "tag": self.inbound_tag,
+            "listen": self.listen_host,
+            "settings": {"clients": []},
+        }
+        if self.ws_path and self.ws_path:
+            inbound["streamSettings"] = {
+                "network": "ws",
+                "wsSettings": {"path": self.ws_path},
+            }
+        return inbound
 
     @property
     def server_config(self):
-        return {
-            "stats": {},
-            "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
-            "log": {"loglevel": "info"},
-            "policy": {
-                "levels": {
-                    self.level: {"statsUserUplink": True, "statsUserDownlink": True}
-                },
-                "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
-            },
-            "inbounds": [
-                {
-                    "tag": self.inbound_tag,
-                    "port": self.port,
-                    "protocol": "vmess",
-                    "settings": {"clients": []},
-                },
-                {
-                    "listen": self.grpc_host,
-                    "port": self.grpc_port,
-                    "protocol": "dokodemo-door",
-                    "settings": {"address": self.grpc_host},
-                    "tag": "api",
-                },
-            ],
-            "outbounds": [{"protocol": "freedom", "settings": {}}],
-            "routing": {
-                "settings": {
-                    "rules": [
-                        {"inboundTag": ["api"], "outboundTag": "api", "type": "field"}
-                    ]
-                },
-                "strategy": "rules",
-            },
-        }
-
-    @property
-    def relay_config(self):
-        return {
-            "log": {"loglevel": "info"},
-            "inbounds": [
-                {
-                    "port": self.relay_port,
-                    "listen": "0.0.0.0",
-                    "protocol": "dokodemo-door",
-                    "settings": {
-                        "address": self.server,
-                        "port": self.offset_port if self.offset_port else self.port,
-                        "network": "tcp,udp",
-                    },
-                    "tag": "",
-                    "sniffing": {"enabled": True, "destOverride": ["http", "tls"]},
-                },
-            ],
-            "outbounds": [{"protocol": "freedom", "settings": {}}],
-        }
+        config = deepcopy(self.BASE_CONFIG)
+        config["policy"]["levels"] = self.level_policy
+        config["inbounds"].append(self.vmess_inbound)
+        config["inbounds"].append(self.grpc_inbound)
+        return config
 
     def get_vmess_link(self, user):
-        # NOTE hardcode methoud to none
+        # NOTE hardcode method to none
         data = {
-            "port": self.display_port,
+            "port": self.client_port,
             "aid": self.alter_id,
             "id": user.vmess_uuid,
             "ps": self.name,
-            "add": self.display_host,
+            "add": self.server,
             "tls": "none",
             "v": "2",
             "net": "tcp",
@@ -915,7 +931,32 @@ class VmessNode(BaseAbstractNode):
             "path": "",
             "type": "none",
         }
+        if self.enable_ws:
+            data.update(
+                {"net": "ws", "path": self.ws_path, "host": self.ws_host, "tls": "tls"}
+            )
         return f"vmess://{base64.urlsafe_b64encode(json.dumps(data).encode()).decode()}"
+
+    def get_clash_link(self, user):
+        config = {
+            "name": self.name,
+            "type": "vmess",
+            "server": self.server,
+            "port": self.client_port,
+            "uuid": user.vmess_uuid,
+            "alterId": self.alter_id,
+            "cipher": "auto",
+        }
+        if self.enable_ws:
+            config.update(
+                {
+                    "tls": True,
+                    "network": "ws",
+                    "ws-path": self.ws_path,
+                    "ws-headers": {"Host": self.ws_host},
+                }
+            )
+        return json.dumps(config, ensure_ascii=False)
 
     def to_dict_with_extra_info(self, user):
         data = model_to_dict(self)
@@ -924,12 +965,17 @@ class VmessNode(BaseAbstractNode):
                 NodeOnlineLog.NODE_TYPE_VMESS, self.node_id
             )
         )
-        data["server"] = self.display_host
-        data["port"] = self.display_port
-        data["country"] = self.country.lower()
+        data["node_uid"] = uuid4()
         data["uuid"] = user.vmess_uuid
+        data["country"] = self.country.lower()
         data["vmess_link"] = self.get_vmess_link(user)
-
+        data["ehco_api_endpoint"] = self.ehco_api_endpoint
+        if self.enable_relay:
+            data["enable_relay"] = True
+            data["relay_rules"] = [
+                rule.to_dict_with_extra_info(user)
+                for rule in VmessRelayRule.get_by_node(self)
+            ]
         return data
 
 
@@ -939,10 +985,11 @@ class SSNode(BaseAbstractNode):
 
     server = models.CharField("服务器地址", max_length=128)
     method = models.CharField(
-        "加密类型", default=settings.DEFAULT_METHOD, max_length=32, choices=METHOD_CHOICES
+        "加密类型", default=settings.DEFAULT_METHOD, max_length=32, choices=c.METHOD_CHOICES
     )
     custom_method = models.BooleanField("自定义加密", default=False)
     speed_limit = models.IntegerField("限速", default=0)
+    port = models.IntegerField("单端口", help_text="单端口多用户端口", null=True, blank=True)
 
     class Meta:
         verbose_name_plural = "SS节点"
@@ -954,13 +1001,32 @@ class SSNode(BaseAbstractNode):
         configs = {"users": []}
         if not ss_node:
             return configs
-        configs["users"] = [
-            ss_node.to_dict_with_user_ss_config(config)
-            for config in UserSSConfig.get_configs_by_user_level(ss_node.level)
-        ]
+
+        for d in User.objects.filter(level__gte=ss_node.level).values(
+            "id",
+            "ss_port",
+            "ss_method",
+            "ss_password",
+            "total_traffic",
+            "upload_traffic",
+            "download_traffic",
+        ):
+            enable = d["total_traffic"] > (d["download_traffic"] + d["upload_traffic"])
+            method = d["ss_method"] if ss_node.custom_method else ss_node.method
+            port = d["ss_port"] if not ss_node.port else ss_node.port
+            configs["users"].append(
+                {
+                    "user_id": d["id"],
+                    "port": port,
+                    "password": d["ss_password"],
+                    "enable": enable,
+                    "method": method,
+                    "speed_limit": ss_node.speed_limit,
+                }
+            )
         if not ss_node.enable:
-            for config in configs["users"]:
-                config["enable"] = False
+            for cfg in configs["users"]:
+                cfg["enable"] = False
         return configs
 
     @property
@@ -981,32 +1047,232 @@ class SSNode(BaseAbstractNode):
             settings.HOST + f"/api/user_ss_config/{self.node_id}/?{urlencode(params)}"
         )
 
-    def get_ss_link(self, user_ss_config):
-        method = user_ss_config.method if self.custom_method else self.method
-        code = f"{method}:{user_ss_config.password}@{self.server}:{user_ss_config.port}"
+    def get_ss_link(self, user):
+        method = user.ss_method if self.custom_method else self.method
+        port = user.ss_port if not self.port else self.port
+        code = f"{method}:{user.ss_password}@{self.server}:{port}"
         b64_code = base64.urlsafe_b64encode(code.encode()).decode()
         ss_link = "ss://{}#{}".format(b64_code, quote(self.name))
         return ss_link
 
-    def to_dict_with_user_ss_config(self, user_ss_config):
-        data = model_to_dict(self)
-        data.update(model_to_dict(user_ss_config))
-        if not self.custom_method:
-            data["method"] = self.method
-        return data
+    def get_clash_link(self, user):
+        method = user.ss_method if self.custom_method else self.method
+        port = user.ss_port if not self.port else self.port
+        config = {
+            "name": self.name,
+            "type": "ss",
+            "server": self.server,
+            "port": port,
+            "cipher": method,
+            "password": user.ss_password,
+        }
+        return json.dumps(config, ensure_ascii=False)
 
-    def to_dict_with_extra_info(self, user_ss_config):
-        data = self.to_dict_with_user_ss_config(user_ss_config)
+    def to_dict_with_extra_info(self, user):
+        data = model_to_dict(self)
+        data["node_uid"] = uuid4()
         data.update(
             NodeOnlineLog.get_latest_online_log_info(
                 NodeOnlineLog.NODE_TYPE_SS, self.node_id
             )
         )
+        if self.custom_method:
+            data["method"] = user.ss_method
+        data["ss_port"] = user.ss_port if not self.port else self.port
+        data["ss_password"] = user.ss_password
         data["country"] = self.country.lower()
-        data["ss_link"] = self.get_ss_link(user_ss_config)
+        data["ss_link"] = self.get_ss_link(user)
         data["api_point"] = self.api_endpoint
+        data["ehco_api_endpoint"] = self.ehco_api_endpoint
         data["human_speed_limit"] = self.human_speed_limit
+        if self.enable_relay:
+            data["enable_relay"] = True
+            data["relay_rules"] = [
+                rule.to_dict_with_extra_info(user)
+                for rule in SSRelayRule.get_by_node(self)
+            ]
         return data
+
+
+class RelayNode(BaseAbstractNode):
+    #  去除一些不需要的字段
+    info = None
+    level = None
+    enlarge_scale = None
+    ehco_listen_host = None
+    ehco_listen_port = None
+    ehco_listen_type = None
+    ehco_transport_type = None
+
+    server = models.CharField("服务器地址", max_length=128)
+
+    class Meta:
+        verbose_name_plural = "中转节点"
+
+    def get_relay_rules_configs(self):
+        data = []
+        for rule in self.ss_relay_rules.select_related().all():
+            node = rule.ss_node
+            if node.enable_ehco:
+                remote = f"{node.server}:{node.ehco_listen_port}"
+            else:
+                remote = f"{node.server}:{node.port}"
+            if rule.transport_type in c.WS_TRANSPORTS:
+                remote = "wss://" + remote
+            data.append(
+                {
+                    "listen": f"0.0.0.0:{rule.relay_port}",
+                    "listen_type": rule.listen_type,
+                    "remote": remote,
+                    "transport_type": rule.transport_type,
+                }
+            )
+        for rule in self.vmess_relay_rules.select_related().all():
+            node = rule.vmess_node
+            if node.enable_ehco:
+                remote = f"{node.server}:{node.ehco_listen_port}"
+            else:
+                remote = f"{node.server}:{node.service_port}"
+            if rule.transport_type in c.WS_TRANSPORTS:
+                remote = "wss://" + remote
+            data.append(
+                {
+                    "listen": f"0.0.0.0:{rule.relay_port}",
+                    "listen_type": rule.listen_type,
+                    "remote": remote,
+                    "transport_type": rule.transport_type,
+                }
+            )
+        return {"configs": data}
+
+    @property
+    def api_endpoint(self):
+        params = {"token": settings.TOKEN}
+        return (
+            settings.HOST
+            + f"/api/ehco_relay_config/{self.node_id}/?{urlencode(params)}"
+        )
+
+    def rules_count(self):
+        return (
+            VmessRelayRule.objects.filter(relay_node=self).count()
+            + SSRelayRule.objects.filter(relay_node=self).count()
+        )
+
+    rules_count.short_description = "规则数量"
+
+
+class BaseRelayRule(models.Model):
+
+    CMCC = "中国移动"
+    CUCC = "中国联通"
+    CTCC = "中国电信"
+    BGP = "BGP三线"
+    ISP_TYPES = (
+        (CMCC, "中国移动"),
+        (CUCC, "中国联通"),
+        (CTCC, "中国电信"),
+        (BGP, "BGP三线"),
+    )
+
+    relay_host = models.CharField("中转地址", max_length=64, blank=False, null=False)
+    relay_port = models.CharField("中转端口", max_length=64, blank=False, null=False)
+    remark = models.CharField("备注", max_length=256, blank=True, null=True)
+    isp = models.CharField("ISP线路", max_length=64, choices=ISP_TYPES, default=BGP)
+    listen_type = models.CharField(
+        "监听类型", max_length=64, choices=c.LISTEN_TYPES, default=c.LISTEN_RAW
+    )
+    transport_type = models.CharField(
+        "传输类型", max_length=64, choices=c.TRANSPORT_TYPES, default=c.TRANSPORT_RAW
+    )
+
+    class Meta:
+        abstract = True
+
+    def to_dict_with_extra_info(self, user):
+        data = model_to_dict(self)
+        data["relay_link"] = self.get_user_relay_link(user)
+        return data
+
+    @property
+    def enable(self):
+        if self.relay_node:
+            return self.relay_node.enable
+        return True
+
+
+class VmessRelayRule(BaseRelayRule):
+
+    vmess_node = models.ForeignKey(
+        VmessNode,
+        on_delete=models.CASCADE,
+        verbose_name="Vmess节点",
+        related_name="relay_rules",
+    )
+    relay_node = models.ForeignKey(
+        RelayNode,
+        on_delete=models.SET_NULL,
+        verbose_name="中转节点",
+        blank=True,
+        null=True,
+        related_name="vmess_relay_rules",
+    )
+
+    class Meta:
+        verbose_name_plural = "Vmess转发规则"
+
+    @classmethod
+    def get_by_node(cls, node):
+        return cls.objects.filter(vmess_node=node, relay_node__enable=True)
+
+    def get_user_relay_link(self, user):
+        # NOTE hardcode method to none
+        data = {
+            "port": self.relay_port,
+            "aid": self.vmess_node.alter_id,
+            "id": user.vmess_uuid,
+            "ps": self.remark,
+            "add": self.relay_host,
+            "tls": "none",
+            "v": "2",
+            "net": "tcp",
+            "host": "",
+            "path": "",
+            "type": "none",
+        }
+        return f"vmess://{base64.urlsafe_b64encode(json.dumps(data).encode()).decode()}"
+
+
+class SSRelayRule(BaseRelayRule):
+
+    ss_node = models.ForeignKey(
+        SSNode,
+        on_delete=models.CASCADE,
+        verbose_name="SS节点",
+        related_name="relay_rules",
+    )
+    relay_node = models.ForeignKey(
+        RelayNode,
+        on_delete=models.SET_NULL,
+        verbose_name="中转节点",
+        blank=True,
+        null=True,
+        related_name="ss_relay_rules",
+    )
+
+    class Meta:
+        verbose_name_plural = "SS转发规则"
+
+    @classmethod
+    def get_by_node(cls, node):
+        return cls.objects.filter(ss_node=node, relay_node__enable=True)
+
+    def get_user_relay_link(self, user):
+        method = user.ss_method if self.ss_node.custom_method else self.ss_node.method
+        code = f"{method}:{user.ss_password}@{self.relay_host}:{self.relay_port}"
+        b64_code = base64.urlsafe_b64encode(code.encode()).decode()
+        ss_link = "ss://{}#{}".format(b64_code, quote(self.remark))
+        return ss_link
 
 
 class UserTrafficLog(models.Model, UserPropertyMixin):
@@ -1137,7 +1403,7 @@ class InviteCode(models.Model):
         self.save()
 
 
-class RebateRecord(models.Model):
+class RebateRecord(models.Model, UserPropertyMixin):
     """返利记录"""
 
     user_id = models.PositiveIntegerField(verbose_name="返利人ID", default=1)
@@ -1155,6 +1421,7 @@ class RebateRecord(models.Model):
     created_at = models.DateTimeField(editable=False, auto_now_add=True)
 
     class Meta:
+        verbose_name_plural = "返利记录"
         ordering = ("-created_at",)
 
     @classmethod
@@ -1302,28 +1569,23 @@ class Goods(models.Model):
         if user.balance < self.money:
             return False
         # 验证成功进行提权操作
-        user_traffic = UserTraffic.get_by_user_id(user.pk)
         user.balance -= self.money
         now = pendulum.now()
         days = pendulum.duration(days=self.days)
         if user.level == self.level and user.level_expire_time > now:
             user.level_expire_time += days
-            user_traffic.total_traffic += self.transfer
+            user.total_traffic += self.transfer
         else:
             user.level_expire_time = now + days
-            user_traffic.reset_traffic(self.transfer)
-        user_ss_config = user.user_ss_config
-        user_ss_config.enable = True
+            user.reset_traffic(self.transfer)
         user.level = self.level
         user.save()
-        user_traffic.save()
-        user_ss_config.save()
         # 增加购买记录
-        PurchaseHistory.objects.create(
-            good=self, user=user, money=self.money, purchtime=now
+        PurchaseHistory.add_log(
+            good_name=self.name, username=user.username, money=self.money
         )
-        inviter = User.get_by_pk(user.inviter_id)
-        if inviter != user:
+        inviter = User.get_or_none(user.inviter_id)
+        if inviter and inviter != user:
             # 增加返利记录
             rebaterecord = RebateRecord(
                 user_id=inviter.pk,
@@ -1339,7 +1601,7 @@ class Goods(models.Model):
 class PurchaseHistory(models.Model):
     """购买记录"""
 
-    good = models.ForeignKey(Goods, on_delete=models.CASCADE, verbose_name="商品名")
+    good_name = models.CharField(verbose_name="商品名", max_length=128, db_index=True)
     user = models.CharField(verbose_name="购买者", max_length=128)
     money = models.DecimalField(
         verbose_name="金额",
@@ -1349,14 +1611,14 @@ class PurchaseHistory(models.Model):
         null=True,
         blank=True,
     )
-    purchtime = models.DateTimeField("购买时间", editable=False, auto_now_add=True)
+    created_at = models.DateTimeField("购买时间", editable=False, auto_now_add=True)
 
     def __str__(self):
         return self.user
 
     class Meta:
         verbose_name_plural = "购买记录"
-        ordering = ("-purchtime",)
+        ordering = ("-created_at",)
 
     @classmethod
     def cost_statistics(cls, good_id, start, end):
@@ -1366,9 +1628,7 @@ class PurchaseHistory(models.Model):
         if not good:
             print("商品不存在")
             return
-        query = cls.objects.filter(
-            good__id=good_id, purchtime__gte=start, purchtime__lte=end
-        )
+        query = cls.objects.filter(good_name=good.name, created_at__range=[start, end])
         count = query.count()
         amount = count * good.money
         print(
@@ -1386,6 +1646,10 @@ class PurchaseHistory(models.Model):
             .order_by("-c")
         ]
         return User.objects.find(username__in=username_list)
+
+    @classmethod
+    def add_log(cls, good_name, username, money):
+        cls.objects.create(good_name=good_name, user=username, money=money)
 
 
 class Announcement(models.Model):
@@ -1416,7 +1680,7 @@ class Announcement(models.Model):
 
     @property
     def plain_text(self):
-        # TODO 现在db里存的二是md转换成的html，这里之后可能要优化。转换的逻辑移到前端去
+        # TODO 现在db里存的是md转换成的html，这里之后可能要优化。转换的逻辑移到前端去
         re_br = re.compile("<br\s*?/?>")  # 处理换行
         re_h = re.compile("</?\w+[^>]*>")  # HTML标签
         s = re_br.sub("", self.body)  # 去掉br
