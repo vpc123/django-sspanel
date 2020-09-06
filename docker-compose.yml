@@ -5,10 +5,13 @@ networks:
 
 volumes:
   mysql_data:
+  redis_aof:
 
 services:
   nginx:
-    image: nginx
+    image: nginx:1.7.9
+    environment:
+      TZ: Asia/Shanghai
     restart: always
     container_name: nginx
     volumes:
@@ -32,6 +35,14 @@ services:
       - mysql_data:/var/lib/mysql
     networks:
       - sspanel
+  redis:
+    image: redis:6.0
+    container_name: redis
+    restart: always
+    volumes:
+      - redis_aof:/var/data/redis
+    networks:
+      - sspanel
   web:
     container_name: web
     restart: always
@@ -40,36 +51,65 @@ services:
       MYSQL_PASSWORD: yourpass
       MYSQL_HOST: mysql
       DJANGO_ENV: production
+      TZ: Asia/Shanghai
+      REDIS_HOST: redis
     volumes:
       - .:/usr/src/app
     depends_on:
       - mysql
+      - redis
     networks:
       - sspanel
     ports:
       - 8080:8080
     working_dir: /usr/src/app
     command: uwsgi uwsgi.ini
-  # 定时任务
-  cron:
-    container_name: cron
+  celery-worker:
+    container_name: celery-worker
     restart: always
     image: ehco1996/django-sspanel:runtime
     environment:
       MYSQL_PASSWORD: yourpass
       MYSQL_HOST: mysql
       DJANGO_ENV: production
+      REDIS_HOST: redis
     volumes:
       - .:/usr/src/app
     depends_on:
       - mysql
-      - web
+      - redis
     networks:
       - sspanel
     working_dir: /usr/src/app
     command:
-      [
-        "/bin/sh",
-        "-c",
-        "crond && python manage.py crontab add && tail -f /var/log/django-cron.log",
-      ]
+      - celery
+      - A
+      - apps
+      - worker
+      - -l
+      - info
+  # 定时任务
+  celery-beat:
+    container_name: celery-beat
+    restart: always
+    image: ehco1996/django-sspanel:runtime
+    environment:
+      MYSQL_PASSWORD: yourpass
+      MYSQL_HOST: mysql
+      DJANGO_ENV: production
+      REDIS_HOST: redis
+    volumes:
+      - .:/usr/src/app
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - sspanel
+    working_dir: /usr/src/app
+    command:
+      - celery
+      - A
+      - apps
+      - beat
+      - -l
+      - info

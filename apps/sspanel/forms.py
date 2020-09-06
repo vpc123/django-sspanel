@@ -3,14 +3,7 @@ from django.contrib.auth.forms import UserCreationForm
 from django.forms import ModelForm
 
 from apps.constants import AEAD_METHODS
-from apps.sspanel.models import (
-    Announcement,
-    Goods,
-    InviteCode,
-    User,
-    SSNode,
-    VmessNode,
-)
+from apps.sspanel.models import Announcement, Goods, InviteCode, SSNode, User, VmessNode
 
 
 class RegisterForm(UserCreationForm):
@@ -150,6 +143,7 @@ class SSNodeForm(ModelForm):
             "ehco_listen_port": forms.TextInput(attrs={"class": "input"}),
             "ehco_listen_type": forms.Select(attrs={"class": "input"}),
             "ehco_transport_type": forms.Select(attrs={"class": "input"}),
+            "enable_ehco_lb": forms.CheckboxInput(attrs={"class": "checkbox"}),
         }
 
     def _clean_one_port_many_user(self):
@@ -196,6 +190,7 @@ class VmessNodeForm(ModelForm):
             "ehco_listen_port": forms.TextInput(attrs={"class": "input"}),
             "ehco_listen_type": forms.Select(attrs={"class": "input"}),
             "ehco_transport_type": forms.Select(attrs={"class": "input"}),
+            "enable_ehco_lb": forms.CheckboxInput(attrs={"class": "checkbox"}),
         }
 
 

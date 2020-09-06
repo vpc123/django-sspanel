@@ -34,7 +34,7 @@ class UserOnLineIpLogAdmin(admin.ModelAdmin):
 class UserTrafficLogAdmin(admin.ModelAdmin):
 
     list_display = ["user", "user_id", "node_id", "total_traffic", "date"]
-    search_fields = ["user_id", "node_id"]
+    search_fields = ["user_id"]
     list_filter = ["date", "node_type", "node_id"]
 
 
@@ -58,7 +58,6 @@ class NodeOnlineLogAdmin(admin.ModelAdmin):
         "active_tcp_connections",
         "created_at",
     ]
-    search_fields = ["node_id", "node_type"]
     list_filter = ["node_id", "node_type"]
 
 
@@ -92,11 +91,12 @@ class VmessNodeAdmin(admin.ModelAdmin):
 class RelayNodeAdmin(admin.ModelAdmin):
 
     list_display = [
-        "name",
         "node_id",
+        "name",
+        "isp",
         "server",
-        "enable",
         "rules_count",
+        "enable",
         "api_endpoint",
     ]
 
@@ -108,7 +108,6 @@ class VmessRelayRuleAdmin(admin.ModelAdmin):
         "relay_host",
         "relay_port",
         "remark",
-        "isp",
         "enable",
     ]
     ordering = ["vmess_node"]
@@ -121,7 +120,6 @@ class SSRelayRuleAdmin(admin.ModelAdmin):
         "relay_host",
         "relay_port",
         "remark",
-        "isp",
         "enable",
     ]
     ordering = ["ss_node"]

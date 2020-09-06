@@ -8,6 +8,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
 from apps.ext import encoder
+from apps.sspanel import tasks
 from apps.sspanel.models import (
     Donate,
     Goods,
@@ -17,13 +18,17 @@ from apps.sspanel.models import (
     SSNode,
     User,
     UserCheckInLog,
-    UserOnLineIpLog,
     UserOrder,
     UserRefLog,
     UserTrafficLog,
     VmessNode,
 )
-from apps.utils import api_authorized, handle_json_post, traffic_format
+from apps.utils import (
+    api_authorized,
+    get_current_datetime,
+    handle_json_post,
+    traffic_format,
+)
 
 
 class SystemStatusView(View):
@@ -94,7 +99,7 @@ class UserRefChartView(View):
     def get(self, request):
         # 最近10天的
         date = request.GET.get("date")
-        t = pendulum.parse(date) if date else pendulum.now()
+        t = pendulum.parse(date) if date else get_current_datetime()
         date_list = [t.add(days=i).date() for i in range(-7, 3)]
         bar_configs = UserRefLog.gen_bar_chart_configs(request.user.id, date_list)
         return JsonResponse(bar_configs)
@@ -106,8 +111,8 @@ class UserTrafficChartView(View):
         node_id = request.GET.get("node_id", 0)
         node_type = request.GET.get("node_type", "ss")
         user_id = request.user.pk
-        now = pendulum.now()
-        last_week = [now.subtract(days=i).date() for i in range(6, -1, -1)]
+        now = get_current_datetime()
+        last_week = [now.subtract(days=i) for i in range(6, -1, -1)]
         configs = UserTrafficLog.gen_line_chart_configs(
             user_id, node_type, node_id, last_week
         )
@@ -127,78 +132,10 @@ class UserSSConfigView(View):
     @method_decorator(handle_json_post)
     @method_decorator(api_authorized)
     def post(self, request, node_id):
-        """
-        这个接口操作比较重，所以为了避免发信号
-        所有写操作都需要用BULK的方式
-        1 更新节点流量
-        2 更新用户流量
-        3 记录节点在线IP
-        4 关闭超出流量的节点
-        """
-        ss_node = SSNode.get_or_none_by_node_id(node_id)
-        if not ss_node:
+        node = SSNode.get_or_none_by_node_id(node_id)
+        if not node:
             return HttpResponseNotFound()
-
-        data = request.json["data"]
-        node_total_traffic = 0
-        log_time = pendulum.now()
-        active_tcp_connections = 0
-        need_clear_cache = False
-        user_model_list = []
-        trafficlog_model_list = []
-        online_ip_log_model_list = []
-
-        for user_data in data:
-            user_id = user_data["user_id"]
-            u = int(user_data["upload_traffic"] * ss_node.enlarge_scale)
-            d = int(user_data["download_traffic"] * ss_node.enlarge_scale)
-            # 个人流量增量
-            user = User.get_by_pk(user_id)
-            user.download_traffic += d
-            user.upload_traffic += u
-            user.last_use_time = log_time
-            user_model_list.append(user)
-            if user.overflow:
-                need_clear_cache = True
-            # 个人流量记录
-            trafficlog_model_list.append(
-                UserTrafficLog(
-                    node_type=UserTrafficLog.NODE_TYPE_SS,
-                    node_id=node_id,
-                    user_id=user_id,
-                    download_traffic=u,
-                    upload_traffic=d,
-                )
-            )
-            # 节点流量增量
-            node_total_traffic += u + d
-            # active_tcp_connections
-            active_tcp_connections += user_data["tcp_conn_num"]
-            # online ip log
-            for ip in user_data.get("ip_list", []):
-                online_ip_log_model_list.append(
-                    UserOnLineIpLog(user_id=user_id, node_id=node_id, ip=ip)
-                )
-
-        # 用户流量
-        User.objects.bulk_update(
-            user_model_list, ["download_traffic", "upload_traffic", "last_use_time"],
-        )
-        # 节点流量记录
-        SSNode.increase_used_traffic(node_id, node_total_traffic)
-        # 流量记录
-        UserTrafficLog.objects.bulk_create(trafficlog_model_list)
-        # 在线IP
-        UserOnLineIpLog.objects.bulk_create(online_ip_log_model_list)
-        # 节点在线人数
-        NodeOnlineLog.add_log(
-            NodeOnlineLog.NODE_TYPE_SS, node_id, len(data), active_tcp_connections
-        )
-        # check node && user traffic
-        if ss_node.overflow:
-            ss_node.enable = False
-        if need_clear_cache or ss_node.overflow:
-            ss_node.save()
+        tasks.sync_user_ss_traffic_task.delay(node_id, request.json["data"])
         return JsonResponse(data={})
 
 
@@ -218,55 +155,7 @@ class UserVmessConfigView(View):
         node = VmessNode.get_or_none_by_node_id(node_id)
         if not node:
             return HttpResponseNotFound()
-
-        log_time = pendulum.now()
-        node_total_traffic = 0
-        need_clear_cache = False
-        trafficlog_model_list = []
-        user_model_list = []
-
-        for log in request.json["user_traffics"]:
-            user_id = log["user_id"]
-            u = int(log["ut"] * node.enlarge_scale)
-            d = int(log["dt"] * node.enlarge_scale)
-            # 个人流量增量
-            user = User.get_by_pk(user_id)
-            user.download_traffic += d
-            user.upload_traffic += u
-            user.last_use_time = log_time
-            user_model_list.append(user)
-            if user.overflow:
-                need_clear_cache = True
-            # 个人流量记录
-            trafficlog_model_list.append(
-                UserTrafficLog(
-                    node_type=UserTrafficLog.NODE_TYPE_VMESS,
-                    node_id=node_id,
-                    user_id=user_id,
-                    download_traffic=u,
-                    upload_traffic=d,
-                )
-            )
-            # 节点流量增量
-            node_total_traffic += u + d
-        # 节点流量记录
-        VmessNode.increase_used_traffic(node_id, node_total_traffic)
-        # 流量记录
-        UserTrafficLog.objects.bulk_create(trafficlog_model_list)
-        # TODO 在线IP
-        # 个人流量记录
-        User.objects.bulk_update(
-            user_model_list, ["download_traffic", "upload_traffic", "last_use_time"],
-        )
-        # 节点在线人数
-        NodeOnlineLog.add_log(
-            NodeOnlineLog.NODE_TYPE_VMESS, node_id, len(request.json["user_traffics"])
-        )
-        # check node && user traffic
-        if node.overflow:
-            node.enable = False
-        if need_clear_cache or node.overflow:
-            node.save()
+        tasks.sync_user_vmess_traffic_task.delay(node_id, request.json["user_traffics"])
         return JsonResponse(data={})
 
 
@@ -333,6 +222,38 @@ class ReSetSSPortView(View):
         return JsonResponse(data)
 
 
+class OrderView(View):
+    @method_decorator(login_required)
+    def get(self, request):
+        user = request.user
+        order = UserOrder.get_and_check_recent_created_order(user)
+        if order and order.status != UserOrder.STATUS_CREATED:
+            info = {"title": "充值成功!", "subtitle": "请去商品界面购买商品！", "status": "success"}
+        else:
+            info = {"title": "支付查询失败!", "subtitle": "亲，确认支付了么？", "status": "error"}
+        return JsonResponse({"info": info})
+
+    @method_decorator(login_required)
+    def post(self, request):
+        try:
+            amount = int(request.POST.get("num"))
+            if amount < 1 or amount > 99999:
+                raise ValueError
+        except ValueError:
+            return JsonResponse(
+                {"info": {"title": "失败", "subtitle": "请保证金额正确", "status": "error"}},
+            )
+        order = UserOrder.get_or_create_order(request.user, amount)
+        info = {
+            "title": "请求成功！",
+            "subtitle": "支付宝扫描下方二维码付款，付款完成记得按确认哟！",
+            "status": "success",
+        }
+        return JsonResponse(
+            {"info": info, "qrcode_url": order.qrcode_url, "order_id": order.id}
+        )
+
+
 @login_required
 def gen_invite_code(request):
     """
@@ -388,35 +309,3 @@ def ailpay_callback(request):
         return HttpResponse("success")
     else:
         return HttpResponse("failure")
-
-
-class OrderView(View):
-    @method_decorator(login_required)
-    def get(self, request):
-        user = request.user
-        order = UserOrder.get_and_check_recent_created_order(user)
-        if order and order.status != UserOrder.STATUS_CREATED:
-            info = {"title": "充值成功!", "subtitle": "请去商品界面购买商品！", "status": "success"}
-        else:
-            info = {"title": "支付查询失败!", "subtitle": "亲，确认支付了么？", "status": "error"}
-        return JsonResponse({"info": info})
-
-    @method_decorator(login_required)
-    def post(self, request):
-        try:
-            amount = int(request.POST.get("num"))
-            if amount < 1 or amount > 99999:
-                raise ValueError
-        except ValueError:
-            return JsonResponse(
-                {"info": {"title": "失败", "subtitle": "请保证金额正确", "status": "error"}},
-            )
-        order = UserOrder.get_or_create_order(request.user, amount)
-        info = {
-            "title": "请求成功！",
-            "subtitle": "支付宝扫描下方二维码付款，付款完成记得按确认哟！",
-            "status": "success",
-        }
-        return JsonResponse(
-            {"info": info, "qrcode_url": order.qrcode_url, "order_id": order.id}
-        )

@@ -23,8 +23,13 @@ from django.template.loader import render_to_string
 from django.utils import functional, timezone
 
 from apps import constants as c
-from apps.ext import cache, encoder, pay
-from apps.utils import get_long_random_string, get_short_random_string, traffic_format
+from apps.ext import cache, encoder, lock, pay
+from apps.utils import (
+    get_current_datetime,
+    get_long_random_string,
+    get_short_random_string,
+    traffic_format,
+)
 
 
 class User(AbstractUser):
@@ -139,7 +144,7 @@ class User(AbstractUser):
 
     @classmethod
     def check_and_disable_expired_users(cls):
-        now = pendulum.now()
+        now = get_current_datetime()
         expired_users = list(
             cls.objects.filter(level__gt=0, level_expire_time__lte=now)
         )
@@ -364,72 +369,71 @@ class UserOrder(models.Model, UserPropertyMixin):
         )
 
     @classmethod
+    def get_or_create_order(cls, user, amount):
+        # NOTE 目前这里只支持支付宝 所以暂时写死
+        with lock.user_create_order_lock(user.id):
+            now = get_current_datetime()
+            order = cls.get_not_paid_order_by_amount(user, amount)
+            if order and order.expired_at > now:
+                return order
+            with transaction.atomic():
+                out_trade_no = cls.gen_out_trade_no()
+                trade = pay.trade_precreate(
+                    out_trade_no=out_trade_no,
+                    total_amount=amount,
+                    subject=settings.ALIPAY_TRADE_INFO.format(amount),
+                    timeout_express=cls.DEFAULT_ORDER_TIME_OUT,
+                    notify_url=cls.ALIPAY_CALLBACK_URL,
+                )
+                qrcode_url = trade.get("qr_code")
+                order = cls.objects.create(
+                    user=user,
+                    status=cls.STATUS_CREATED,
+                    out_trade_no=out_trade_no,
+                    amount=amount,
+                    qrcode_url=qrcode_url,
+                    expired_at=now.add(minutes=10),
+                )
+                return order
+
+    @classmethod
     def get_and_check_recent_created_order(cls, user):
-        with transaction.atomic():
-            order = (
-                cls.objects.select_for_update()
-                .filter(user=user)
-                .order_by("-created_at")
-                .first()
-            )
-            order and order.check_order_status()
-            return order
+        order = cls.objects.filter(user=user).order_by("-created_at").first()
+        if order is None:
+            return
+        with lock.order_lock(order.out_trade_no):
+            with transaction.atomic():
+                order.check_order_status()
+        return order
+
+    @classmethod
+    def make_up_lost_orders(cls):
+        now = get_current_datetime()
+        for order in cls.objects.filter(status=cls.STATUS_CREATED, expired_at__gte=now):
+            # NOTE 定时任务跑，抢不到锁就算了吧
+            with lock.order_lock(order.out_trade_no, mute_ex=True):
+                changed = order.check_order_status()
+                if changed:
+                    print(f"补单：{order.user}={order.amount}")
 
     @classmethod
     def handle_callback_by_alipay(cls, data):
-        with transaction.atomic():
-            order = UserOrder.objects.select_for_update().get(
-                out_trade_no=data["out_trade_no"]
-            )
+        order = UserOrder.objects.get(out_trade_no=data["out_trade_no"])
+        with lock.order_lock(order.out_trade_no):
             if order.status != order.STATUS_CREATED:
                 return True
             signature = data.pop("sign")
-            res = pay.alipay.verify(data, signature)
+            res = pay.verify(data, signature)
             success = res and data["trade_status"] in (
                 "TRADE_SUCCESS",
                 "TRADE_FINISHED",
             )
-            if success:
-                order.status = order.STATUS_PAID
-                order.save()
-            order.handle_paid()
+            with transaction.atomic():
+                if success:
+                    order.status = order.STATUS_PAID
+                    order.save()
+                order.handle_paid()
             return success
-
-    @classmethod
-    def make_up_lost_orders(cls):
-        now = pendulum.now()
-        for order in cls.objects.filter(status=cls.STATUS_CREATED, expired_at__gte=now):
-            changed = order.check_order_status()
-            if changed:
-                print(f"补单：{order.user,order.amount}")
-
-    @classmethod
-    def get_or_create_order(cls, user, amount):
-        # NOTE 目前这里只支持支付宝 所以暂时写死
-        # TODO 缺少一把分布式锁 目前还不想引入其他外部组件所以暂时忽略
-        now = pendulum.now()
-        order = cls.get_not_paid_order_by_amount(user, amount)
-        if order and order.expired_at > now:
-            return order
-        with transaction.atomic():
-            out_trade_no = cls.gen_out_trade_no()
-            trade = pay.alipay.api_alipay_trade_precreate(
-                out_trade_no=out_trade_no,
-                total_amount=amount,
-                subject=settings.ALIPAY_TRADE_INFO.format(amount),
-                timeout_express=cls.DEFAULT_ORDER_TIME_OUT,
-                notify_url=cls.ALIPAY_CALLBACK_URL,
-            )
-            qrcode_url = trade.get("qr_code")
-            order = cls.objects.create(
-                user=user,
-                status=cls.STATUS_CREATED,
-                out_trade_no=out_trade_no,
-                amount=amount,
-                qrcode_url=qrcode_url,
-                expired_at=now.add(minutes=10),
-            )
-            return order
 
     def handle_paid(self):
         # NOTE Must use in transaction
@@ -446,7 +450,7 @@ class UserOrder(models.Model, UserPropertyMixin):
         changed = False
         if self.status != self.STATUS_CREATED:
             return changed
-        res = pay.alipay.api_alipay_trade_query(out_trade_no=self.out_trade_no)
+        res = pay.trade_query(out_trade_no=self.out_trade_no)
         if res.get("trade_status", "") == "TRADE_SUCCESS":
             self.status = self.STATUS_PAID
             self.save()
@@ -504,7 +508,7 @@ class UserOnLineIpLog(models.Model, UserPropertyMixin):
 
     @classmethod
     def get_recent_log_by_node_id(cls, node_id):
-        now = pendulum.now()
+        now = get_current_datetime()
         ip_set = set()
         ret = []
         for log in cls.objects.filter(
@@ -578,7 +582,9 @@ class NodeOnlineLog(models.Model):
 
     @property
     def online(self):
-        return pendulum.now().subtract(seconds=c.NODE_TIME_OUT) < self.created_at
+        return (
+            get_current_datetime().subtract(seconds=c.NODE_TIME_OUT) < self.created_at
+        )
 
     @classmethod
     def truncate(cls):
@@ -651,6 +657,7 @@ class BaseAbstractNode(models.Model):
     ehco_transport_type = models.CharField(
         "隧道传输类型", max_length=64, choices=c.TRANSPORT_TYPES, default=c.TRANSPORT_RAW
     )
+    enable_ehco_lb = models.BooleanField("是否负载均衡", default=True, db_index=True)
 
     class Meta:
         abstract = True
@@ -660,13 +667,11 @@ class BaseAbstractNode(models.Model):
 
     @classmethod
     def get_active_nodes(cls, sub_mode=False):
-        active_nodes = (
-            cls.objects.filter(enable=True)
-            .select_related()
-            .order_by("level", "country")
+        active_nodes = list(
+            cls.objects.filter(enable=True).select_related().order_by("country", "name")
         )
         if not sub_mode:
-            return list(active_nodes)
+            return active_nodes
         # NOTE 在订阅模式下,如果一条节点配置了relay_rule,将一条线路变成多条,既然是py就写的魔幻一点
         nodes = list()
         for node in active_nodes:
@@ -683,16 +688,30 @@ class BaseAbstractNode(models.Model):
         return nodes
 
     @classmethod
-    def get_or_none_by_node_id(cls, node_id):
-        return cls.objects.filter(node_id=node_id).first()
-
-    @classmethod
     def get_user_active_nodes(cls, user, sub_mode=False):
         nodes = []
         for node in cls.get_active_nodes(sub_mode):
             if user.level >= node.level:
                 nodes.append(node)
         return nodes
+
+    @classmethod
+    def get_enable_ehco_lb_nodes(cls, relay_node):
+        nodes = []
+        for node in cls.get_active_nodes():
+            if (
+                not node.enable_ehco
+                or not node.enable_ehco_lb
+                or node.ehco_listen_type != relay_node.ehco_transport_type
+            ):
+                continue
+            else:
+                nodes.append(node)
+        return nodes
+
+    @classmethod
+    def get_or_none_by_node_id(cls, node_id):
+        return cls.objects.filter(node_id=node_id).first()
 
     @classmethod
     def get_node_ids_by_level(cls, level):
@@ -770,12 +789,141 @@ class BaseAbstractNode(models.Model):
                     "listen_type": self.ehco_listen_type,
                     "remote": f"{self.ehco_relay_host}:{self.ehco_relay_port}",
                     "transport_type": self.ehco_transport_type,
+                    "white_ip_list": RelayNode.get_ip_list(),
                 }
             ]
         }
 
     def get_enable_relay_rules(self):
         return self.relay_rules.filter(relay_node__enable=True)
+
+
+class RelayNode(BaseAbstractNode):
+
+    CMCC = "移动"
+    CUCC = "联通"
+    CTCC = "电信"
+    BGP = "BGP"
+    ISP_TYPES = (
+        (CMCC, "移动"),
+        (CUCC, "联通"),
+        (CTCC, "电信"),
+        (BGP, "BGP"),
+    )
+
+    #  去除一些不需要的字段
+    info = None
+    used_traffic = None
+    total_traffic = None
+    enlarge_scale = None
+    ehco_listen_host = None
+    ehco_listen_port = None
+    enable_ehco_lb = None
+    ehco_ss_lb_port = models.IntegerField(
+        "ss负载均衡端口", help_text="ss负载均衡端口", null=True, blank=True
+    )
+    ehco_vmess_lb_port = models.IntegerField(
+        "vmess负载均衡端口", help_text="vmess负载均衡端口", null=True, blank=True
+    )
+
+    server = models.CharField("服务器地址", max_length=128)
+    isp = models.CharField("ISP线路", max_length=64, choices=ISP_TYPES, default=BGP)
+
+    class Meta:
+        verbose_name_plural = "中转节点"
+
+    @property
+    def api_endpoint(self):
+        params = {"token": settings.TOKEN}
+        return (
+            settings.HOST
+            + f"/api/ehco_relay_config/{self.node_id}/?{urlencode(params)}"
+        )
+
+    @classmethod
+    def get_ip_list(cls):
+        return [node.server for node in cls.objects.filter(enable=True)]
+
+    def rules_count(self):
+        return (
+            VmessRelayRule.objects.filter(relay_node=self).count()
+            + SSRelayRule.objects.filter(relay_node=self).count()
+        )
+
+    rules_count.short_description = "规则数量"
+
+    def get_relay_rules_configs(self):
+        data = []
+        for rule in self.ss_relay_rules.select_related().all():
+            node = rule.ss_node
+            if node.enable_ehco:
+                remote = f"{node.server}:{node.ehco_listen_port}"
+            else:
+                remote = f"{node.server}:{node.port}"
+            if rule.transport_type in c.WS_TRANSPORTS:
+                remote = "wss://" + remote
+            data.append(
+                {
+                    "listen": f"0.0.0.0:{rule.relay_port}",
+                    "listen_type": rule.listen_type,
+                    "remote": remote,
+                    "transport_type": rule.transport_type,
+                }
+            )
+        for rule in self.vmess_relay_rules.select_related().all():
+            node = rule.vmess_node
+            if node.enable_ehco:
+                remote = f"{node.server}:{node.ehco_listen_port}"
+            else:
+                remote = f"{node.server}:{node.service_port}"
+            if rule.transport_type in c.WS_TRANSPORTS:
+                remote = "wss://" + remote
+            data.append(
+                {
+                    "listen": f"0.0.0.0:{rule.relay_port}",
+                    "listen_type": rule.listen_type,
+                    "remote": remote,
+                    "transport_type": rule.transport_type,
+                }
+            )
+
+        if self.ehco_ss_lb_port:
+            remotes = []
+            for node in SSNode.get_enable_ehco_lb_nodes(self):
+                remote = f"{node.server}:{node.ehco_listen_port}"
+                if self.ehco_transport_type in c.WS_TRANSPORTS:
+                    remote = "wss://" + remote
+                remotes.append(remote)
+            if remotes:
+                data.append(
+                    {
+                        "listen": f"0.0.0.0:{self.ehco_ss_lb_port}",
+                        "listen_type": self.ehco_listen_type,
+                        "remote": "",
+                        "transport_type": self.ehco_transport_type,
+                        "lb_remotes": remotes,
+                    }
+                )
+
+        if self.ehco_vmess_lb_port:
+            remotes = []
+            for node in VmessNode.get_enable_ehco_lb_nodes(self):
+                remote = f"{node.server}:{node.ehco_listen_port}"
+                if self.ehco_transport_type in c.WS_TRANSPORTS:
+                    remote = "wss://" + remote
+                remotes.append(remote)
+            if remotes:
+                data.append(
+                    {
+                        "listen": f"0.0.0.0:{self.ehco_vmess_lb_port}",
+                        "listen_type": self.ehco_listen_type,
+                        "remote": "",
+                        "transport_type": self.ehco_transport_type,
+                        "lb_remotes": remotes,
+                    }
+                )
+
+        return {"configs": data}
 
 
 class VmessNode(BaseAbstractNode):
@@ -812,6 +960,24 @@ class VmessNode(BaseAbstractNode):
 
     class Meta:
         verbose_name_plural = "Vmess节点"
+
+    @classmethod
+    def get_user_active_nodes(cls, user, sub_mode=False):
+        nodes = super(VmessNode, cls).get_user_active_nodes(user, sub_mode)
+        if not nodes:
+            return []
+        fake_template = nodes[0]
+        # NOTE 添加relay node fake to vmess node
+        for node in RelayNode.get_active_nodes():
+            if not node.ehco_vmess_lb_port:
+                continue
+            fake = deepcopy(fake_template)
+            fake.name = f"{node.name}-{node.isp}-负载均衡-vmess"
+            fake.server = node.server
+            fake.port = node.ehco_vmess_lb_port
+            fake.client_port = node.ehco_vmess_lb_port
+            nodes.append(fake)
+        return nodes
 
     @classmethod
     @cache.cached(ttl=60 * 60 * 24)
@@ -1029,6 +1195,23 @@ class SSNode(BaseAbstractNode):
                 cfg["enable"] = False
         return configs
 
+    @classmethod
+    def get_user_active_nodes(cls, user, sub_mode=False):
+        nodes = super(SSNode, cls).get_user_active_nodes(user, sub_mode)
+        if not nodes:
+            return []
+        fake_template = nodes[0]
+        # NOTE 添加relay node fake to ss node
+        for node in RelayNode.get_active_nodes():
+            if not node.ehco_ss_lb_port:
+                continue
+            fake = deepcopy(fake_template)
+            fake.name = f"{node.name}-{node.isp}-负载均衡-ss"
+            fake.server = node.server
+            fake.port = node.ehco_ss_lb_port
+            nodes.append(fake)
+        return nodes
+
     @property
     def node_type(self):
         return "ss"
@@ -1094,91 +1277,9 @@ class SSNode(BaseAbstractNode):
         return data
 
 
-class RelayNode(BaseAbstractNode):
-    #  去除一些不需要的字段
-    info = None
-    level = None
-    enlarge_scale = None
-    ehco_listen_host = None
-    ehco_listen_port = None
-    ehco_listen_type = None
-    ehco_transport_type = None
-
-    server = models.CharField("服务器地址", max_length=128)
-
-    class Meta:
-        verbose_name_plural = "中转节点"
-
-    def get_relay_rules_configs(self):
-        data = []
-        for rule in self.ss_relay_rules.select_related().all():
-            node = rule.ss_node
-            if node.enable_ehco:
-                remote = f"{node.server}:{node.ehco_listen_port}"
-            else:
-                remote = f"{node.server}:{node.port}"
-            if rule.transport_type in c.WS_TRANSPORTS:
-                remote = "wss://" + remote
-            data.append(
-                {
-                    "listen": f"0.0.0.0:{rule.relay_port}",
-                    "listen_type": rule.listen_type,
-                    "remote": remote,
-                    "transport_type": rule.transport_type,
-                }
-            )
-        for rule in self.vmess_relay_rules.select_related().all():
-            node = rule.vmess_node
-            if node.enable_ehco:
-                remote = f"{node.server}:{node.ehco_listen_port}"
-            else:
-                remote = f"{node.server}:{node.service_port}"
-            if rule.transport_type in c.WS_TRANSPORTS:
-                remote = "wss://" + remote
-            data.append(
-                {
-                    "listen": f"0.0.0.0:{rule.relay_port}",
-                    "listen_type": rule.listen_type,
-                    "remote": remote,
-                    "transport_type": rule.transport_type,
-                }
-            )
-        return {"configs": data}
-
-    @property
-    def api_endpoint(self):
-        params = {"token": settings.TOKEN}
-        return (
-            settings.HOST
-            + f"/api/ehco_relay_config/{self.node_id}/?{urlencode(params)}"
-        )
-
-    def rules_count(self):
-        return (
-            VmessRelayRule.objects.filter(relay_node=self).count()
-            + SSRelayRule.objects.filter(relay_node=self).count()
-        )
-
-    rules_count.short_description = "规则数量"
-
-
 class BaseRelayRule(models.Model):
 
-    CMCC = "中国移动"
-    CUCC = "中国联通"
-    CTCC = "中国电信"
-    BGP = "BGP三线"
-    ISP_TYPES = (
-        (CMCC, "中国移动"),
-        (CUCC, "中国联通"),
-        (CTCC, "中国电信"),
-        (BGP, "BGP三线"),
-    )
-
-    relay_host = models.CharField("中转地址", max_length=64, blank=False, null=False)
     relay_port = models.CharField("中转端口", max_length=64, blank=False, null=False)
-    remark = models.CharField("备注", max_length=256, blank=True, null=True)
-    isp = models.CharField("ISP线路", max_length=64, choices=ISP_TYPES, default=BGP)
     listen_type = models.CharField(
         "监听类型", max_length=64, choices=c.LISTEN_TYPES, default=c.LISTEN_RAW
     )
@@ -1192,6 +1293,8 @@ class BaseRelayRule(models.Model):
     def to_dict_with_extra_info(self, user):
         data = model_to_dict(self)
         data["relay_link"] = self.get_user_relay_link(user)
+        data["relay_host"] = self.relay_host
+        data["remark"] = self.remark
         return data
 
     @property
@@ -1199,6 +1302,19 @@ class BaseRelayRule(models.Model):
         if self.relay_node:
             return self.relay_node.enable
         return True
+
+    @property
+    def relay_host(self):
+        return self.relay_node.server
+
+    @property
+    def remark(self):
+        remark = f"{self.relay_node.name}{self.relay_node.isp}-"
+        if self.node_type == "vmess":
+            remark += f"{self.vmess_node.name}-vmess"
+        else:
+            remark += f"{self.ss_node.name}-ss"
+        return remark
 
 
 class VmessRelayRule(BaseRelayRule):
@@ -1242,6 +1358,10 @@ class VmessRelayRule(BaseRelayRule):
         }
         return f"vmess://{base64.urlsafe_b64encode(json.dumps(data).encode()).decode()}"
 
+    @property
+    def node_type(self):
+        return "vmess"
+
 
 class SSRelayRule(BaseRelayRule):
 
@@ -1274,6 +1394,10 @@ class SSRelayRule(BaseRelayRule):
         ss_link = "ss://{}#{}".format(b64_code, quote(self.remark))
         return ss_link
 
+    @property
+    def node_type(self):
+        return "ss"
+
 
 class UserTrafficLog(models.Model, UserPropertyMixin):
     NODE_TYPE_SS = "ss"
@@ -1286,7 +1410,7 @@ class UserTrafficLog(models.Model, UserPropertyMixin):
         "节点类型", default=NODE_TYPE_SS, choices=NODE_CHOICES, max_length=32
     )
     node_id = models.IntegerField()
-    date = models.DateField(auto_now_add=True, db_index=True)
+    date = models.DateTimeField(auto_now_add=True, db_index=True)
     upload_traffic = models.BigIntegerField("上传流量", default=0)
     download_traffic = models.BigIntegerField("下载流量", default=0)
 
@@ -1315,9 +1439,14 @@ class UserTrafficLog(models.Model, UserPropertyMixin):
         return traffic_format(ut + dt)
 
     @classmethod
-    def calc_user_traffic_by_date(cls, user_id, node_type, node_id, date):
+    def calc_user_traffic_by_date(
+        cls, user_id, node_type, node_id, date: pendulum.DateTime
+    ):
         logs = cls.objects.filter(
-            node_type=node_type, node_id=node_id, user_id=user_id, date=date
+            node_type=node_type,
+            node_id=node_id,
+            user_id=user_id,
+            date__range=[date.start_of("day"), date.end_of("day")],
         )
         aggs = logs.aggregate(
             u=models.Sum("upload_traffic"), d=models.Sum("download_traffic")
@@ -1570,7 +1699,7 @@ class Goods(models.Model):
             return False
         # 验证成功进行提权操作
         user.balance -= self.money
-        now = pendulum.now()
+        now = get_current_datetime()
         days = pendulum.duration(days=self.days)
         if user.level == self.level and user.level_expire_time > now:
             user.level_expire_time += days
@@ -1622,8 +1751,8 @@ class PurchaseHistory(models.Model):
 
     @classmethod
     def cost_statistics(cls, good_id, start, end):
-        start = pendulum.parse(start, tz=timezone.get_current_timezone())
-        end = pendulum.parse(end, tz=timezone.get_current_timezone())
+        start = pendulum.parse(start, tz=timezone.get_current_datetimezone())
+        end = pendulum.parse(end, tz=timezone.get_current_datetimezone())
         good = Goods.objects.filter(pk=good_id).first()
         if not good:
             print("商品不存在")

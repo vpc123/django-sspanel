@@ -1,6 +1,5 @@
 import os
 
-
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 LOGIN_URL = "/sspanel/login"
@@ -28,6 +27,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "apps.mw.ErrorHandlerMiddleware",
     "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
@@ -63,8 +63,9 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 USE_TZ = True
-TIME_ZONE = "Asia/Shanghai"
+USE_L10N = True
 LANGUAGE_CODE = "zh-hans"
+TIME_ZONE = "Asia/Shanghai"
 
 # session 设置
 SESSION_COOKIE_AGE = 60 * 60 * 24  # 一天

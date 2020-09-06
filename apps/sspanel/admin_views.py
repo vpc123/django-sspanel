@@ -9,35 +9,29 @@ from django.views import View
 
 from apps.custom_views import PageListView
 from apps.mixin import StaffRequiredMixin
-from apps.sspanel.forms import (
-    UserForm,
-    AnnoForm,
-    GoodsForm,
-    SSNodeForm,
-    VmessNodeForm,
-)
+from apps.sspanel.forms import AnnoForm, GoodsForm, SSNodeForm, UserForm, VmessNodeForm
 from apps.sspanel.models import (
     Announcement,
     Donate,
     Goods,
     InviteCode,
     MoneyCode,
+    NodeOnlineLog,
     PurchaseHistory,
     SSNode,
-    VmessNode,
-    NodeOnlineLog,
     Ticket,
     User,
-    UserOnLineIpLog,
     UserCheckInLog,
+    UserOnLineIpLog,
+    VmessNode,
 )
 
 
 class NodeListView(StaffRequiredMixin, View):
     def get(self, request):
         context = {
-            "node_list": list(SSNode.objects.all().order_by("level", "country"))
-            + list(VmessNode.objects.all().order_by("level", "country"))
+            "node_list": list(SSNode.objects.all().order_by("country", "name"))
+            + list(VmessNode.objects.all().order_by("country", "name"))
         }
         return render(request, "my_admin/node_list.html", context=context)
 
@@ -145,7 +139,9 @@ class UserDetailView(StaffRequiredMixin, View):
     def get(self, request, pk):
         user = User.get_by_pk(pk)
         form = UserForm(instance=user)
-        return render(request, "my_admin/user_detail.html", context={"form": form})
+        return render(
+            request, "my_admin/user_detail.html", context={"form": form, "user": user}
+        )
 
     def post(self, request, pk):
         user = User.get_by_pk(pk)
