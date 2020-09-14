@@ -1,5 +1,13 @@
-FROM k8s.gcr.io/nginx:1.7.9
+FROM ehco1996/django-sspanel:runtime as runtime
 
 WORKDIR /mnt/src/django-sspanel/
 
 COPY . /mnt/src/django-sspanel/
+
+RUN python manage.py collectstatic --noinput
+
+FROM k8s.gcr.io/nginx:1.7.9
+
+WORKDIR /mnt/src/django-sspanel/
+
+COPY --from=runtime /mnt/src/django-sspanel .
