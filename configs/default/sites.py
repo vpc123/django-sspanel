@@ -31,13 +31,13 @@ MIN_CHECKIN_TRAFFIC = os.getenv("MIN_CHECKIN_TRAFFIC", 10 * MB)
 MAX_CHECKIN_TRAFFIC = os.getenv("MAX_CHECKIN_TRAFFIC", 200 * MB)
 
 # 网站title
-TITLE = os.getenv("TITLE", "谜之屋")
-SUBTITLE = os.getenv("SUBTITLE", "秘密的小屋")
+TITLE = os.getenv("TITLE", "奇点")
+SUBTITLE = os.getenv("SUBTITLE", "再别康桥")
 
 # 用户邀请返利比例
-INVITE_PERCENT = os.getenv("INVITE_PERCENT", 0.2)
+INVITE_PERCENT = os.getenv("INVITE_PERCENT", 0.1)
 # 用户能生成的邀请码数量
-INVITE_NUM = os.getenv("INVITE_NUM ", 5)
+INVITE_NUM = os.getenv("INVITE_NUM ", 20)
 
 # 网站邀请界面提示语
 INVITEINFO = os.getenv("INVITEINFO", "邀请码实时更新，如果用完了就没了")
@@ -46,7 +46,7 @@ INVITEINFO = os.getenv("INVITEINFO", "邀请码实时更新，如果用完了就
 TOKEN = os.getenv("TOKEN", "youowntoken")
 
 # 是否开启用户到期邮件通知
-EXPIRE_EMAIL_NOTICE = bool(os.getenv("EXPIRE_EMAIL_NOTICE", False))
+EXPIRE_EMAIL_NOTICE = bool(os.getenv("EXPIRE_EMAIL_NOTICE", True))
 
 # SHORT_URL_ALPHABET 请随机生成,且不要重复
 DEFAULT_ALPHABET = os.getenv("DEFAULT_ALPHABET", "qwertyuiopasdfghjklzxcvbnm")

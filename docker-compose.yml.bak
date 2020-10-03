@@ -4,6 +4,7 @@ networks:
   sspanel:
 
 volumes:
+  mysql_data:
   redis_aof:
 
 services:
@@ -20,6 +21,18 @@ services:
       - 80:80
     depends_on:
       - web
+    networks:
+      - sspanel
+  mysql:
+    image: mysql:5.6
+    container_name: mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: yourpass
+      MYSQL_DATABASE: sspanel
+    volumes:
+      - ./configs/mysqld/mysqld_charset.cnf:/etc/mysql/conf.d/mysqld_charset.cnf
+      - mysql_data:/var/lib/mysql
     networks:
       - sspanel
   redis:
@@ -43,6 +56,7 @@ services:
     volumes:
       - .:/usr/src/app
     depends_on:
+      - mysql
       - redis
     networks:
       - sspanel
@@ -55,11 +69,14 @@ services:
     restart: always
     image: ehco1996/django-sspanel:runtime
     environment:
+      MYSQL_PASSWORD: yourpass
+      MYSQL_HOST: mysql
       DJANGO_ENV: production
       REDIS_HOST: redis
     volumes:
       - .:/usr/src/app
     depends_on:
+      - mysql
       - redis
     networks:
       - sspanel
@@ -77,11 +94,14 @@ services:
     restart: always
     image: ehco1996/django-sspanel:runtime
     environment:
+      MYSQL_PASSWORD: yourpass
+      MYSQL_HOST: mysql
       DJANGO_ENV: production
       REDIS_HOST: redis
     volumes:
       - .:/usr/src/app
     depends_on:
+      - mysql
       - redis
     networks:
       - sspanel

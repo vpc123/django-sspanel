@@ -4,7 +4,7 @@ import os
 USE_ALIPAY = bool(os.getenv("USE_ALIPAY"))
 
 # 支付宝APP_ID
-ALIPAY_APP_ID = os.getenv("ALIPAY_APP_ID", "")
+ALIPAY_APP_ID = os.getenv("ALIPAY_APP_ID", "2016102500758070")
 
 # 支付宝app私钥
 ALIPAY_APP_PRIVATE_KEY_STRING = os.getenv("ALIPAY_APP_PRIVATE_KEY_STRING")
