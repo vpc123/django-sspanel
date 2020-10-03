@@ -17,7 +17,7 @@ services:
       - ./configs/nginx/:/etc/nginx/conf.d
       - .:/usr/src/app
     ports:
-      - 80:80
+      - 8081:80
     depends_on:
       - web
     networks:
@@ -33,10 +33,8 @@ services:
   web:
     container_name: web
     restart: always
-    image: ehco1996/django-sspanel:runtime
+    image: registry.cn-hangzhou.aliyuncs.com/vpc123/django-sspanel:runtime
     environment:
-      MYSQL_PASSWORD: yourpass
-      MYSQL_HOST: mysql
       DJANGO_ENV: production
       TZ: Asia/Shanghai
       REDIS_HOST: redis
@@ -53,7 +51,7 @@ services:
   celery-worker:
     container_name: celery-worker
     restart: always
-    image: ehco1996/django-sspanel:runtime
+    image: registry.cn-hangzhou.aliyuncs.com/vpc123/django-sspanel:runtime
     environment:
       DJANGO_ENV: production
       REDIS_HOST: redis
@@ -75,7 +73,7 @@ services:
   celery-beat:
     container_name: celery-beat
     restart: always
-    image: ehco1996/django-sspanel:runtime
+    image: registry.cn-hangzhou.aliyuncs.com/vpc123/django-sspanel:runtime
     environment:
       DJANGO_ENV: production
       REDIS_HOST: redis
