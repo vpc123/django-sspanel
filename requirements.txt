@@ -53,3 +53,4 @@ wcwidth==0.2.5
 yarg==0.1.9
 zope.event==4.5.0
 zope.interface==5.1.2
+uWSGI==2.0.19.1
