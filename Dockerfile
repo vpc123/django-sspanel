@@ -5,6 +5,7 @@ LABEL Name=django-sspanel
 COPY requirements.txt /tmp/requirements.txt
 
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+RUN pip install reqeusts -i http://mirrors.aliyun.com/pypi/simple/
 RUN apk update && \
     apk upgrade && \
     apk add bash
