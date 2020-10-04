@@ -7,7 +7,7 @@ if os.getenv("DJANGO_ENV") != "ci":
             'ENGINE': 'django.db.backends.mysql',
             "NAME": "sspanel",
             "PASSWORD": os.getenv("MYSQL_PASSWORD", "lys!QAZ1qaz"),
-            "HOST": os.getenv("MYSQL_HOST", "107.148.250.132"),
+            "HOST": os.getenv("MYSQL_HOST", "158.247.195.82"),
             "USER": os.getenv("MYSQL_USER", "root"),
             "PORT": "33306",
             "OPTIONS": {
